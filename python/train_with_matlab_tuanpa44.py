@@ -122,16 +122,47 @@ class ReplayBuffer:
 class MATLABDRLTrainer:
     """DRL Training server that communicates with MATLAB via TCP."""
     
-    def __init__(self, port=5555, device='cuda', verbose=True):
-        self.port = port
-        self.device = device
-        self.verbose = verbose
+    def __init__(self, args):
+        self.port = args.port
+        self.device = args.device
+        self.verbose = args.verbose
         
         # Network setup
         self.actor = None
         self.updater = None
-        self.hyperparams = None
-        
+
+        # GNB system configs
+        self.gnbConfigs = {
+            'n_cell_ue':args.n_cell_ue,
+            'max_sched_ue':args.max_sched_ue,
+            'n_rbg':args.n_rbg,
+            'n_layers':args.n_layers,
+        }
+
+        # RL Hyperparameters
+        act_dim = args.max_sched_ue + 1  # +1 for NO_ALLOC
+        obs_dim =  args.max_sched_ue*(args.n_rbg*2+5)
+        self.hyperparams = {
+            'act_dim': act_dim,
+            'obs_dim': obs_dim,
+            'hidden_dim': args.hidden,
+            'n_quantiles': args.n_quantiles,
+            'gamma': args.gamma,
+            'tau': args.tau,
+            'beta': args.beta,
+            'lr_actor': args.lr_actor,
+            'lr_critic': args.lr_critic,
+            'lr_alpha': args.lr_alpha,
+            'fallback_action': args.fallback_action,
+            'rb_capacity': args.rb_capacity,
+            'batch_size': args.batch_size,
+            'learning_starts': args.learning_starts,
+            'train_freq': args.train_freq,
+            'save_freq': args.save_freq,
+            'out_dir': args.out_dir,
+            'max_paired_ues': args.max_paired_ues,  # Max distinct UEs per RBG
+        }
+    
         # Training state
         self.replay_buffer = None
         self.total_steps = 0  # TTI count
@@ -159,8 +190,28 @@ class MATLABDRLTrainer:
         # Logging
         self.train_log = None
         self.eval_log = None
+
+        # Initializing networks
+        # Initialize networks if not done yet
+        if self.actor is None:
+            print("Initializing networks...")
+            hp = self.hyperparams if isinstance(self.hyperparams, dict) else {}
+            self.initialize_networks(
+                obs_dim=hp.get('obs_dim'),
+                act_dim=hp.get('act_dim'),
+                n_rbg=self.gnbConfigs['n_rbg'],
+                hidden_dim=hp.get('hidden_dim'),
+                n_quantiles=hp.get('n_quantiles'),
+                gamma=hp.get('gamma'),
+                tau=hp.get('tau'),
+                lr_actor=hp.get('lr_actor'),
+                lr_critic=hp.get('lr_critic'),
+                lr_alpha=hp.get('lr_alpha'),
+                beta=hp.get('beta'),
+                fallback_action=hp.get('fallback_action')
+            )
         
-    def initialize_networks(self, obs_dim, n_rbg, n_actions_per_rbg, hidden_dim, 
+    def initialize_networks(self, obs_dim, act_dim, n_rbg, hidden_dim, 
                            n_quantiles, gamma, tau, lr_actor, 
                            lr_critic, lr_alpha, beta, fallback_action):
         """Initialize actor, critic, and updater."""
@@ -168,12 +219,12 @@ class MATLABDRLTrainer:
         max_paired_ues = hp.get('max_paired_ues', 4)
         
         # Store fixed action dimension for the lifetime of the trainer
-        self.fixed_n_actions = n_actions_per_rbg
+        self.fixed_n_actions = act_dim
         
         print(f"[Trainer] Initializing networks...")
         print(f"  - Observation dim: {obs_dim}")
         print(f"  - Number of RBGs: {n_rbg}")
-        print(f"  - Actions per RBG: {n_actions_per_rbg}")
+        print(f"  - Actions per RBG: {act_dim}")
         print(f"  - Hidden dim: {hidden_dim}")
         print(f"  - N quantiles: {n_quantiles}")
         print(f"  - Max paired UEs per RBG: {max_paired_ues}")
@@ -182,7 +233,7 @@ class MATLABDRLTrainer:
         self.actor = MultiBranchActor(
             obs_dim=obs_dim,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             hidden=hidden_dim
         ).to(self.device)
         
@@ -190,7 +241,7 @@ class MATLABDRLTrainer:
         q1 = MultiBranchQuantileCritic(
             obs_dim=obs_dim,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             n_quantiles=n_quantiles,
             hidden=hidden_dim
         ).to(self.device)
@@ -198,7 +249,7 @@ class MATLABDRLTrainer:
         q2 = MultiBranchQuantileCritic(
             obs_dim=obs_dim,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             n_quantiles=n_quantiles,
             hidden=hidden_dim
         ).to(self.device)
@@ -206,7 +257,7 @@ class MATLABDRLTrainer:
         q1_target = MultiBranchQuantileCritic(
             obs_dim=obs_dim,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             n_quantiles=n_quantiles,
             hidden=hidden_dim
         ).to(self.device)
@@ -214,7 +265,7 @@ class MATLABDRLTrainer:
         q2_target = MultiBranchQuantileCritic(
             obs_dim=obs_dim,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             n_quantiles=n_quantiles,
             hidden=hidden_dim
         ).to(self.device)
@@ -243,7 +294,7 @@ class MATLABDRLTrainer:
             q1_target=q1_target,
             q2_target=q2_target,
             n_rbg=n_rbg,
-            act_dim=n_actions_per_rbg,
+            act_dim=act_dim,
             hp=hp,
             device=str(self.device)
         )
@@ -267,222 +318,6 @@ class MATLABDRLTrainer:
 
         # Apply deferred checkpoint weights (if any)
         self._apply_pending_checkpoint_if_any()
-    
-    def load_checkpoint(self, checkpoint_path: str) -> bool:
-        """
-        Safe checkpoint loader:
-        - If networks are NOT initialized yet, only load counters now and defer weights.
-        - If networks ARE initialized, load weights immediately.
-        """
-        if not checkpoint_path:
-            return False
-        if not os.path.exists(checkpoint_path):
-            print(f"[Trainer] Warning: Checkpoint not found: {checkpoint_path}")
-            return False
-
-        # Always load meta/counters early
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.total_steps = int(ckpt.get("total_steps", 0))
-        self.layer_steps = int(ckpt.get("layer_steps", self.total_steps * 16))
-        self.episode_count = int(ckpt.get("episode_count", 0))
-        
-        # Restore fixed_n_actions if saved (critical for mask consistency)
-        if "fixed_n_actions" in ckpt and ckpt["fixed_n_actions"] is not None:
-            self.fixed_n_actions = int(ckpt["fixed_n_actions"])
-            print(f"[Trainer] Restored fixed_n_actions = {self.fixed_n_actions}")
-
-        # Defer or apply weights
-        if self.actor is None or self.updater is None:
-            # Networks not ready -> defer
-            setattr(self, "_pending_ckpt_path", checkpoint_path)
-            print(f"[Trainer] Checkpoint metadata loaded, weights deferred until networks init.")
-            print(f"[Trainer] Pending checkpoint: {checkpoint_path}")
-            print(f"[Trainer] Resumed counters: TTI={self.total_steps}, LayerStep={self.layer_steps}")
-            return True
-
-        # Networks ready -> load now
-        if "actor" in ckpt and ckpt["actor"]:
-            self.actor.load_state_dict(ckpt["actor"])
-        if "updater" in ckpt and ckpt["updater"]:
-            updater_state = ckpt["updater"]
-            if 'q1' in updater_state:
-                self.updater.q1.load_state_dict(updater_state['q1'])
-            if 'q2' in updater_state:
-                self.updater.q2.load_state_dict(updater_state['q2'])
-            if 'q1_target' in updater_state:
-                self.updater.q1_t.load_state_dict(updater_state['q1_target'])
-            if 'q2_target' in updater_state:
-                self.updater.q2_t.load_state_dict(updater_state['q2_target'])
-            if 'log_alpha' in updater_state:
-                self.updater.log_alpha.data.copy_(updater_state['log_alpha'])
-            if 'opt_actor' in updater_state:
-                self.updater.opt_actor.load_state_dict(updater_state['opt_actor'])
-            if 'opt_critic' in updater_state:
-                self.updater.opt_critic.load_state_dict(updater_state['opt_critic'])
-            if 'opt_alpha' in updater_state:
-                self.updater.opt_alpha.load_state_dict(updater_state['opt_alpha'])
-
-        print(f"[Trainer] Loaded checkpoint (weights + counters) from {checkpoint_path}")
-        print(f"[Trainer] Resumed: TTI={self.total_steps}, LayerStep={self.layer_steps}")
-        return True
-    
-    def _apply_pending_checkpoint_if_any(self):
-        """Helper: apply deferred checkpoint once actor/updater exist."""
-        pending = getattr(self, "_pending_ckpt_path", None)
-        if not pending:
-            return
-        if self.actor is None or self.updater is None:
-            return
-        if not os.path.exists(pending):
-            print(f"[Trainer] Warning: pending checkpoint path missing: {pending}")
-            setattr(self, "_pending_ckpt_path", None)
-            return
-
-        ckpt = torch.load(pending, map_location=self.device)
-        if "actor" in ckpt and ckpt["actor"]:
-            self.actor.load_state_dict(ckpt["actor"])
-        if "updater" in ckpt and ckpt["updater"]:
-            updater_state = ckpt["updater"]
-            if 'q1' in updater_state:
-                self.updater.q1.load_state_dict(updater_state['q1'])
-            if 'q2' in updater_state:
-                self.updater.q2.load_state_dict(updater_state['q2'])
-            if 'q1_target' in updater_state:
-                self.updater.q1_t.load_state_dict(updater_state['q1_target'])
-            if 'q2_target' in updater_state:
-                self.updater.q2_t.load_state_dict(updater_state['q2_target'])
-            if 'log_alpha' in updater_state:
-                self.updater.log_alpha.data.copy_(updater_state['log_alpha'])
-            if 'opt_actor' in updater_state:
-                self.updater.opt_actor.load_state_dict(updater_state['opt_actor'])
-            if 'opt_critic' in updater_state:
-                self.updater.opt_critic.load_state_dict(updater_state['opt_critic'])
-            if 'opt_alpha' in updater_state:
-                self.updater.opt_alpha.load_state_dict(updater_state['opt_alpha'])
-
-        print(f"[Trainer] Applied deferred checkpoint weights from {pending}")
-        setattr(self, "_pending_ckpt_path", None)
-    
-    def _log_model_parameters(self):
-        """Log the number of parameters in each model component."""
-        def count_params(model):
-            """Count total and trainable parameters."""
-            total = sum(p.numel() for p in model.parameters())
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            return total, trainable
-        
-        def format_params(num):
-            """Format parameter count with appropriate suffix (K, M, B)."""
-            if num >= 1e9:
-                return f"{num / 1e9:.2f}B"
-            elif num >= 1e6:
-                return f"{num / 1e6:.2f}M"
-            elif num >= 1e3:
-                return f"{num / 1e3:.2f}K"
-            else:
-                return str(num)
-        
-        print("\n" + "=" * 60)
-        print("MODEL PARAMETERS SUMMARY")
-        print("=" * 60)
-        
-        total_all = 0
-        trainable_all = 0
-        
-        # Actor
-        if self.actor is not None:
-            total, trainable = count_params(self.actor)
-            total_all += total
-            trainable_all += trainable
-            print(f"  Actor:      {format_params(total):>10} total, {format_params(trainable):>10} trainable")
-        
-        # Critics (from updater)
-        if self.updater is not None:
-            # Q1
-            total, trainable = count_params(self.updater.q1)
-            total_all += total
-            trainable_all += trainable
-            print(f"  Critic Q1:  {format_params(total):>10} total, {format_params(trainable):>10} trainable")
-            
-            # Q2
-            total, trainable = count_params(self.updater.q2)
-            total_all += total
-            trainable_all += trainable
-            print(f"  Critic Q2:  {format_params(total):>10} total, {format_params(trainable):>10} trainable")
-            
-            # Q1 Target (not trainable but counts in model size)
-            total_t1, _ = count_params(self.updater.q1_t)
-            print(f"  Q1 Target:  {format_params(total_t1):>10} total (frozen)")
-            
-            # Q2 Target
-            total_t2, _ = count_params(self.updater.q2_t)
-            print(f"  Q2 Target:  {format_params(total_t2):>10} total (frozen)")
-        
-        print("-" * 60)
-        print(f"  TOTAL (trainable networks): {format_params(total_all):>10} ({total_all:,} params)")
-        print(f"  TRAINABLE:                  {format_params(trainable_all):>10} ({trainable_all:,} params)")
-        print("=" * 60 + "\n")
-    
-    def save_checkpoint(self, save_dir='checkpoints'):
-        """Save current model checkpoint."""
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = os.path.join(save_dir, f"checkpoint_layer_{self.layer_steps}_{timestamp}.pt")
-        
-        # DSACDUpdater doesn't have state_dict, save components separately
-        updater_state = {}
-        if self.updater is not None:
-            updater_state = {
-                'q1': self.updater.q1.state_dict(),
-                'q2': self.updater.q2.state_dict(),
-                'q1_target': self.updater.q1_t.state_dict(),
-                'q2_target': self.updater.q2_t.state_dict(),
-                'log_alpha': self.updater.log_alpha.detach().cpu(),
-                'opt_actor': self.updater.opt_actor.state_dict(),
-                'opt_critic': self.updater.opt_critic.state_dict(),
-                'opt_alpha': self.updater.opt_alpha.state_dict(),
-            }
-        
-        torch.save({
-            'actor': self.actor.state_dict() if self.actor else {},
-            'updater': updater_state,
-            'total_steps': self.total_steps,
-            'layer_steps': self.layer_steps,
-            'episode_count': self.episode_count,
-            'fixed_n_actions': self.fixed_n_actions,  # Critical: save network action dim
-        }, checkpoint_path)
-        
-        print(f"[Trainer] Saved checkpoint to {checkpoint_path}")
-        
-        # Also save logs
-        self.save_logs(save_dir)
-        
-        return checkpoint_path
-    
-    def save_logs(self, save_dir='checkpoints'):
-        """Save training and evaluation logs to JSON files."""
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save eval_log
-        if self.eval_log is not None:
-            eval_log_path = os.path.join(save_dir, f"eval_log_tti{self.total_steps}_{timestamp}.json")
-            try:
-                with open(eval_log_path, 'w') as f:
-                    json.dump(self.eval_log, f, indent=2)
-                print(f"[Trainer] Saved eval log to {eval_log_path}")
-            except Exception as e:
-                print(f"[Trainer] Warning: Could not save eval log: {e}")
-        
-        # Save train_log
-        if self.train_log is not None:
-            train_log_path = os.path.join(save_dir, f"train_log_tti{self.total_steps}_{timestamp}.json")
-            try:
-                with open(train_log_path, 'w') as f:
-                    json.dump(self.train_log, f, indent=2)
-                print(f"[Trainer] Saved train log to {train_log_path}")
-            except Exception as e:
-                print(f"[Trainer] Warning: Could not save train log: {e}")
     
     def build_observation(self, data, max_ues, num_rbg, allocated_rbg=None, cross_corr=None, 
                           prev_alloc=None, layer=0):
@@ -1150,54 +985,16 @@ class MATLABDRLTrainer:
                 self.client_socket.close()
                 self.client_socket = None
     
-    def _emergency_save(self, reason="emergency"):
-        """Save checkpoint in emergency situations (error, Ctrl+C, etc.)."""
-        if self.actor is None:
-            print("[Trainer] No model to save (actor not initialized)")
-            return
-        
-        hp = self.hyperparams if isinstance(self.hyperparams, dict) else {}
-        out_dir = hp.get('out_dir', 'checkpoints')
-        os.makedirs(out_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = os.path.join(out_dir, f"checkpoint_{reason}_tti{self.total_steps}_{timestamp}.pt")
-        
-        # DSACDUpdater doesn't have state_dict, save components separately
-        updater_state = {}
-        if self.updater is not None:
-            try:
-                updater_state = {
-                    'q1': self.updater.q1.state_dict(),
-                    'q2': self.updater.q2.state_dict(),
-                    'q1_target': self.updater.q1_t.state_dict(),
-                    'q2_target': self.updater.q2_t.state_dict(),
-                    'log_alpha': self.updater.log_alpha.detach().cpu(),
-                    'opt_actor': self.updater.opt_actor.state_dict(),
-                    'opt_critic': self.updater.opt_critic.state_dict(),
-                    'opt_alpha': self.updater.opt_alpha.state_dict(),
-                }
-            except Exception as e:
-                print(f"[Trainer] Warning: Could not save updater state: {e}")
-        
-        torch.save({
-            'actor': self.actor.state_dict() if self.actor else {},
-            'updater': updater_state,
-            'total_steps': self.total_steps,
-            'layer_steps': self.layer_steps,
-            'episode_count': self.episode_count,
-        }, checkpoint_path)
-        
-        print(f"[Trainer] Emergency checkpoint saved to {checkpoint_path}")
-        print(f"[Trainer] Stats at save: TTI={self.total_steps}, LayerSteps={self.layer_steps}")
-    
     def handle_tti_observation(self, data, prev_obs_layers, prev_actions_layers, prev_masks_layers=None):
+        # 1. Once python handler receives new observation from matlab, it packages this observation with the previous recorded data to
+        # compose transition tuples [curr_obs, curr_mask, action, reward, next_obs, next_mask]
+        # 2. Push transition experiences to replay buffer
+        # 3. Once there are enough transitions, optimizing agent and critics
         if prev_obs_layers is None or prev_actions_layers is None:
             return
 
         max_layers = len(prev_actions_layers)
 
-        # ---- IMPORTANT FIX: allocation for reward must be from the TTI we are storing (t-1) ----
         # When we receive TTI t observation, MATLAB is reporting metrics for TTI t-1 (last sent allocation).
         prev_alloc = self.last_allocation_matrix if self.last_allocation_matrix is not None else []
 
@@ -1391,26 +1188,6 @@ class MATLABDRLTrainer:
             print(f"  Shape: {obs.shape}")
             print(f"  Min: {obs.min():.4f}, Max: {obs.max():.4f}, Mean: {obs.mean():.4f}")
             print(f"  Sample values (first 10): {obs[:10].tolist()}")
-        
-        # Initialize networks if not done yet
-        if self.actor is None:
-            obs_dim = obs.shape[0]
-            n_actions = max_ues + 1  # UEs + NO_ALLOC
-            hp = self.hyperparams if isinstance(self.hyperparams, dict) else {}
-            self.initialize_networks(
-                obs_dim=obs_dim,
-                n_rbg=num_rbg,
-                n_actions_per_rbg=n_actions,
-                hidden_dim=hp.get('hidden_dim', 256),
-                n_quantiles=hp.get('n_quantiles', 32),
-                gamma=hp.get('gamma', 0.99),
-                tau=hp.get('tau', 0.005),
-                lr_actor=hp.get('lr_actor', 3e-4),
-                lr_critic=hp.get('lr_critic', 3e-4),
-                lr_alpha=hp.get('lr_alpha', 3e-4),
-                beta=hp.get('beta', 0.98),
-                fallback_action=hp.get('fallback_action', -1)
-            )
         
         # Generate allocation matrix
         explore = self.training_enabled
@@ -1667,79 +1444,6 @@ class MATLABDRLTrainer:
         
         return layer_rewards
     
-    def log_eval_stats(self, data, allocation_matrix, policy_type="sample"):
-        """
-        Log evaluation statistics for the current TTI.
-        
-        Args:
-            data: TTI observation data from MATLAB
-            allocation_matrix: Current allocation [num_rbg x max_layers]
-            policy_type: "sample" (current policy), "greedy", or "random"
-        """
-        if self.eval_log is None:
-            return
-        
-        # Extract metrics from data (MATLAB should send these)
-        tti = self.total_steps
-        max_ues = data.get('max_ues', 16)
-        
-        # Get throughput from MATLAB feedback
-        total_cell_tput = data.get('prev_tti_throughput', 0) or data.get('tti_throughput', 0) or 0
-        
-        # Per-UE throughputs - build list [ue0_tput, ue1_tput, ...]
-        ue_tputs_dict = data.get('prev_ue_throughputs', {}) or data.get('ue_throughputs', {}) or {}
-        total_ue_tput = []
-        for ue_id in range(1, max_ues + 1):  # 1-indexed UE IDs
-            tput = float(ue_tputs_dict.get(ue_id, ue_tputs_dict.get(str(ue_id), 0)))
-            total_ue_tput.append(tput)
-        
-        # Per-UE allocation counts - build list [ue0_allocs, ue1_allocs, ...]
-        alloc_counts = [0] * max_ues
-        avg_layers_per_rbg = 0
-        pf_utility = 0
-        
-        if allocation_matrix:
-            num_rbg = len(allocation_matrix)
-            max_layers = len(allocation_matrix[0]) if allocation_matrix else 16
-            
-            # Count allocations per UE
-            for rbg_row in allocation_matrix:
-                for ue in rbg_row:
-                    if ue > 0 and ue <= max_ues:
-                        alloc_counts[ue - 1] += 1  # Convert 1-indexed to 0-indexed
-            
-            # Average layers per RBG
-            layers_per_rbg = [sum(1 for ue in rbg_row if ue > 0) for rbg_row in allocation_matrix]
-            avg_layers_per_rbg = sum(layers_per_rbg) / num_rbg if num_rbg > 0 else 0
-            
-            # PF utility: sum of log(throughput) for all UEs with allocations
-            pf_utility = 0
-            for ue_idx, (tput, allocs) in enumerate(zip(total_ue_tput, alloc_counts)):
-                if allocs > 0 and tput > 0:
-                    pf_utility += math.log(max(tput, 1e-6))
-                elif allocs > 0:
-                    pf_utility += math.log(1e-6)  # Placeholder for UE with allocation but no throughput data
-        
-        # Store in eval_log
-        if policy_type in self.eval_log:
-            self.eval_log[policy_type]["tti"].append(tti)
-            self.eval_log[policy_type]["total_cell_tput"].append(total_cell_tput)
-            self.eval_log[policy_type]["total_ue_tput"].append(total_ue_tput)  # List per UE
-            self.eval_log[policy_type]["alloc_counts"].append(alloc_counts)    # List per UE
-            self.eval_log[policy_type]["pf_utility"].append(pf_utility)
-            self.eval_log[policy_type]["avg_layers_per_rbg"].append(avg_layers_per_rbg)
-        
-        # Periodic logging
-        if self.verbose and self.total_steps % 50 == 0:
-            total_allocs = sum(alloc_counts)
-            scheduled_ues = sum(1 for a in alloc_counts if a > 0)
-            print(f"[Trainer] === EVAL STATS (TTI {tti}, {policy_type}) ===")
-            print(f"  Total cell throughput: {total_cell_tput:.2f}")
-            print(f"  Total UE throughput (sum): {sum(total_ue_tput):.2f}")
-            print(f"  Total allocations: {total_allocs}, Scheduled UEs: {scheduled_ues}")
-            print(f"  Avg layers/RBG: {avg_layers_per_rbg:.2f}")
-            print(f"  PF utility: {pf_utility:.4f}")
-    
     def train_step(self, batch_size=256):
         """Perform one training step using DSACD's per-RBG batch format.
         
@@ -1862,6 +1566,336 @@ class MATLABDRLTrainer:
         json_str = json.dumps(response) + '\n'
         self.client_socket.sendall(json_str.encode('utf-8'))
     
+    def _apply_pending_checkpoint_if_any(self):
+        """Helper: apply deferred checkpoint once actor/updater exist."""
+        pending = getattr(self, "_pending_ckpt_path", None)
+        if not pending:
+            return
+        if self.actor is None or self.updater is None:
+            return
+        if not os.path.exists(pending):
+            print(f"[Trainer] Warning: pending checkpoint path missing: {pending}")
+            setattr(self, "_pending_ckpt_path", None)
+            return
+
+        ckpt = torch.load(pending, map_location=self.device)
+        if "actor" in ckpt and ckpt["actor"]:
+            self.actor.load_state_dict(ckpt["actor"])
+        if "updater" in ckpt and ckpt["updater"]:
+            updater_state = ckpt["updater"]
+            if 'q1' in updater_state:
+                self.updater.q1.load_state_dict(updater_state['q1'])
+            if 'q2' in updater_state:
+                self.updater.q2.load_state_dict(updater_state['q2'])
+            if 'q1_target' in updater_state:
+                self.updater.q1_t.load_state_dict(updater_state['q1_target'])
+            if 'q2_target' in updater_state:
+                self.updater.q2_t.load_state_dict(updater_state['q2_target'])
+            if 'log_alpha' in updater_state:
+                self.updater.log_alpha.data.copy_(updater_state['log_alpha'])
+            if 'opt_actor' in updater_state:
+                self.updater.opt_actor.load_state_dict(updater_state['opt_actor'])
+            if 'opt_critic' in updater_state:
+                self.updater.opt_critic.load_state_dict(updater_state['opt_critic'])
+            if 'opt_alpha' in updater_state:
+                self.updater.opt_alpha.load_state_dict(updater_state['opt_alpha'])
+
+        print(f"[Trainer] Applied deferred checkpoint weights from {pending}")
+        setattr(self, "_pending_ckpt_path", None)
+    
+    def log_eval_stats(self, data, allocation_matrix, policy_type="sample"):
+        """
+        Log evaluation statistics for the current TTI.
+        
+        Args:
+            data: TTI observation data from MATLAB
+            allocation_matrix: Current allocation [num_rbg x max_layers]
+            policy_type: "sample" (current policy), "greedy", or "random"
+        """
+        if self.eval_log is None:
+            return
+        
+        # Extract metrics from data (MATLAB should send these)
+        tti = self.total_steps
+        max_ues = data.get('max_ues', 16)
+        
+        # Get throughput from MATLAB feedback
+        total_cell_tput = data.get('prev_tti_throughput', 0) or data.get('tti_throughput', 0) or 0
+        
+        # Per-UE throughputs - build list [ue0_tput, ue1_tput, ...]
+        ue_tputs_dict = data.get('prev_ue_throughputs', {}) or data.get('ue_throughputs', {}) or {}
+        total_ue_tput = []
+        for ue_id in range(1, max_ues + 1):  # 1-indexed UE IDs
+            tput = float(ue_tputs_dict.get(ue_id, ue_tputs_dict.get(str(ue_id), 0)))
+            total_ue_tput.append(tput)
+        
+        # Per-UE allocation counts - build list [ue0_allocs, ue1_allocs, ...]
+        alloc_counts = [0] * max_ues
+        avg_layers_per_rbg = 0
+        pf_utility = 0
+        
+        if allocation_matrix:
+            num_rbg = len(allocation_matrix)
+            max_layers = len(allocation_matrix[0]) if allocation_matrix else 16
+            
+            # Count allocations per UE
+            for rbg_row in allocation_matrix:
+                for ue in rbg_row:
+                    if ue > 0 and ue <= max_ues:
+                        alloc_counts[ue - 1] += 1  # Convert 1-indexed to 0-indexed
+            
+            # Average layers per RBG
+            layers_per_rbg = [sum(1 for ue in rbg_row if ue > 0) for rbg_row in allocation_matrix]
+            avg_layers_per_rbg = sum(layers_per_rbg) / num_rbg if num_rbg > 0 else 0
+            
+            # PF utility: sum of log(throughput) for all UEs with allocations
+            pf_utility = 0
+            for ue_idx, (tput, allocs) in enumerate(zip(total_ue_tput, alloc_counts)):
+                if allocs > 0 and tput > 0:
+                    pf_utility += math.log(max(tput, 1e-6))
+                elif allocs > 0:
+                    pf_utility += math.log(1e-6)  # Placeholder for UE with allocation but no throughput data
+        
+        # Store in eval_log
+        if policy_type in self.eval_log:
+            self.eval_log[policy_type]["tti"].append(tti)
+            self.eval_log[policy_type]["total_cell_tput"].append(total_cell_tput)
+            self.eval_log[policy_type]["total_ue_tput"].append(total_ue_tput)  # List per UE
+            self.eval_log[policy_type]["alloc_counts"].append(alloc_counts)    # List per UE
+            self.eval_log[policy_type]["pf_utility"].append(pf_utility)
+            self.eval_log[policy_type]["avg_layers_per_rbg"].append(avg_layers_per_rbg)
+        
+        # Periodic logging
+        if self.verbose and self.total_steps % 50 == 0:
+            total_allocs = sum(alloc_counts)
+            scheduled_ues = sum(1 for a in alloc_counts if a > 0)
+            print(f"[Trainer] === EVAL STATS (TTI {tti}, {policy_type}) ===")
+            print(f"  Total cell throughput: {total_cell_tput:.2f}")
+            print(f"  Total UE throughput (sum): {sum(total_ue_tput):.2f}")
+            print(f"  Total allocations: {total_allocs}, Scheduled UEs: {scheduled_ues}")
+            print(f"  Avg layers/RBG: {avg_layers_per_rbg:.2f}")
+            print(f"  PF utility: {pf_utility:.4f}")
+    
+    def _log_model_parameters(self):
+        """Log the number of parameters in each model component."""
+        def count_params(model):
+            """Count total and trainable parameters."""
+            total = sum(p.numel() for p in model.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            return total, trainable
+        
+        def format_params(num):
+            """Format parameter count with appropriate suffix (K, M, B)."""
+            if num >= 1e9:
+                return f"{num / 1e9:.2f}B"
+            elif num >= 1e6:
+                return f"{num / 1e6:.2f}M"
+            elif num >= 1e3:
+                return f"{num / 1e3:.2f}K"
+            else:
+                return str(num)
+        
+        print("\n" + "=" * 60)
+        print("MODEL PARAMETERS SUMMARY")
+        print("=" * 60)
+        
+        total_all = 0
+        trainable_all = 0
+        
+        # Actor
+        if self.actor is not None:
+            total, trainable = count_params(self.actor)
+            total_all += total
+            trainable_all += trainable
+            print(f"  Actor:      {format_params(total):>10} total, {format_params(trainable):>10} trainable")
+        
+        # Critics (from updater)
+        if self.updater is not None:
+            # Q1
+            total, trainable = count_params(self.updater.q1)
+            total_all += total
+            trainable_all += trainable
+            print(f"  Critic Q1:  {format_params(total):>10} total, {format_params(trainable):>10} trainable")
+            
+            # Q2
+            total, trainable = count_params(self.updater.q2)
+            total_all += total
+            trainable_all += trainable
+            print(f"  Critic Q2:  {format_params(total):>10} total, {format_params(trainable):>10} trainable")
+            
+            # Q1 Target (not trainable but counts in model size)
+            total_t1, _ = count_params(self.updater.q1_t)
+            print(f"  Q1 Target:  {format_params(total_t1):>10} total (frozen)")
+            
+            # Q2 Target
+            total_t2, _ = count_params(self.updater.q2_t)
+            print(f"  Q2 Target:  {format_params(total_t2):>10} total (frozen)")
+        
+        print("-" * 60)
+        print(f"  TOTAL (trainable networks): {format_params(total_all):>10} ({total_all:,} params)")
+        print(f"  TRAINABLE:                  {format_params(trainable_all):>10} ({trainable_all:,} params)")
+        print("=" * 60 + "\n")
+    
+    def save_checkpoint(self, save_dir='checkpoints'):
+        """Save current model checkpoint."""
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = os.path.join(save_dir, f"checkpoint_layer_{self.layer_steps}_{timestamp}.pt")
+        
+        # DSACDUpdater doesn't have state_dict, save components separately
+        updater_state = {}
+        if self.updater is not None:
+            updater_state = {
+                'q1': self.updater.q1.state_dict(),
+                'q2': self.updater.q2.state_dict(),
+                'q1_target': self.updater.q1_t.state_dict(),
+                'q2_target': self.updater.q2_t.state_dict(),
+                'log_alpha': self.updater.log_alpha.detach().cpu(),
+                'opt_actor': self.updater.opt_actor.state_dict(),
+                'opt_critic': self.updater.opt_critic.state_dict(),
+                'opt_alpha': self.updater.opt_alpha.state_dict(),
+            }
+        
+        torch.save({
+            'actor': self.actor.state_dict() if self.actor else {},
+            'updater': updater_state,
+            'total_steps': self.total_steps,
+            'layer_steps': self.layer_steps,
+            'episode_count': self.episode_count,
+            'fixed_n_actions': self.fixed_n_actions,  # Critical: save network action dim
+        }, checkpoint_path)
+        
+        print(f"[Trainer] Saved checkpoint to {checkpoint_path}")
+        
+        # Also save logs
+        self.save_logs(save_dir)
+        
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path: str) -> bool:
+        """
+        Safe checkpoint loader:
+        - If networks are NOT initialized yet, only load counters now and defer weights.
+        - If networks ARE initialized, load weights immediately.
+        """
+        if not checkpoint_path:
+            return False
+        if not os.path.exists(checkpoint_path):
+            print(f"[Trainer] Warning: Checkpoint not found: {checkpoint_path}")
+            return False
+
+        # Always load meta/counters early
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.total_steps = int(ckpt.get("total_steps", 0))
+        self.layer_steps = int(ckpt.get("layer_steps", self.total_steps * 16))
+        self.episode_count = int(ckpt.get("episode_count", 0))
+        
+        # Restore fixed_n_actions if saved (critical for mask consistency)
+        if "fixed_n_actions" in ckpt and ckpt["fixed_n_actions"] is not None:
+            self.fixed_n_actions = int(ckpt["fixed_n_actions"])
+            print(f"[Trainer] Restored fixed_n_actions = {self.fixed_n_actions}")
+
+        # Defer or apply weights
+        if self.actor is None or self.updater is None:
+            # Networks not ready -> defer
+            setattr(self, "_pending_ckpt_path", checkpoint_path)
+            print(f"[Trainer] Checkpoint metadata loaded, weights deferred until networks init.")
+            print(f"[Trainer] Pending checkpoint: {checkpoint_path}")
+            print(f"[Trainer] Resumed counters: TTI={self.total_steps}, LayerStep={self.layer_steps}")
+            return True
+
+        # Networks ready -> load now
+        if "actor" in ckpt and ckpt["actor"]:
+            self.actor.load_state_dict(ckpt["actor"])
+        if "updater" in ckpt and ckpt["updater"]:
+            updater_state = ckpt["updater"]
+            if 'q1' in updater_state:
+                self.updater.q1.load_state_dict(updater_state['q1'])
+            if 'q2' in updater_state:
+                self.updater.q2.load_state_dict(updater_state['q2'])
+            if 'q1_target' in updater_state:
+                self.updater.q1_t.load_state_dict(updater_state['q1_target'])
+            if 'q2_target' in updater_state:
+                self.updater.q2_t.load_state_dict(updater_state['q2_target'])
+            if 'log_alpha' in updater_state:
+                self.updater.log_alpha.data.copy_(updater_state['log_alpha'])
+            if 'opt_actor' in updater_state:
+                self.updater.opt_actor.load_state_dict(updater_state['opt_actor'])
+            if 'opt_critic' in updater_state:
+                self.updater.opt_critic.load_state_dict(updater_state['opt_critic'])
+            if 'opt_alpha' in updater_state:
+                self.updater.opt_alpha.load_state_dict(updater_state['opt_alpha'])
+
+        print(f"[Trainer] Loaded checkpoint (weights + counters) from {checkpoint_path}")
+        print(f"[Trainer] Resumed: TTI={self.total_steps}, LayerStep={self.layer_steps}")
+        return True
+    
+    def save_logs(self, save_dir='checkpoints'):
+        """Save training and evaluation logs to JSON files."""
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save eval_log
+        if self.eval_log is not None:
+            eval_log_path = os.path.join(save_dir, f"eval_log_tti{self.total_steps}_{timestamp}.json")
+            try:
+                with open(eval_log_path, 'w') as f:
+                    json.dump(self.eval_log, f, indent=2)
+                print(f"[Trainer] Saved eval log to {eval_log_path}")
+            except Exception as e:
+                print(f"[Trainer] Warning: Could not save eval log: {e}")
+        
+        # Save train_log
+        if self.train_log is not None:
+            train_log_path = os.path.join(save_dir, f"train_log_tti{self.total_steps}_{timestamp}.json")
+            try:
+                with open(train_log_path, 'w') as f:
+                    json.dump(self.train_log, f, indent=2)
+                print(f"[Trainer] Saved train log to {train_log_path}")
+            except Exception as e:
+                print(f"[Trainer] Warning: Could not save train log: {e}")
+
+    def _emergency_save(self, reason="emergency"):
+        """Save checkpoint in emergency situations (error, Ctrl+C, etc.)."""
+        if self.actor is None:
+            print("[Trainer] No model to save (actor not initialized)")
+            return
+        
+        hp = self.hyperparams if isinstance(self.hyperparams, dict) else {}
+        out_dir = hp.get('out_dir', 'checkpoints')
+        os.makedirs(out_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = os.path.join(out_dir, f"checkpoint_{reason}_tti{self.total_steps}_{timestamp}.pt")
+        
+        # DSACDUpdater doesn't have state_dict, save components separately
+        updater_state = {}
+        if self.updater is not None:
+            try:
+                updater_state = {
+                    'q1': self.updater.q1.state_dict(),
+                    'q2': self.updater.q2.state_dict(),
+                    'q1_target': self.updater.q1_t.state_dict(),
+                    'q2_target': self.updater.q2_t.state_dict(),
+                    'log_alpha': self.updater.log_alpha.detach().cpu(),
+                    'opt_actor': self.updater.opt_actor.state_dict(),
+                    'opt_critic': self.updater.opt_critic.state_dict(),
+                    'opt_alpha': self.updater.opt_alpha.state_dict(),
+                }
+            except Exception as e:
+                print(f"[Trainer] Warning: Could not save updater state: {e}")
+        
+        torch.save({
+            'actor': self.actor.state_dict() if self.actor else {},
+            'updater': updater_state,
+            'total_steps': self.total_steps,
+            'layer_steps': self.layer_steps,
+            'episode_count': self.episode_count,
+        }, checkpoint_path)
+        
+        print(f"[Trainer] Emergency checkpoint saved to {checkpoint_path}")
+        print(f"[Trainer] Stats at save: TTI={self.total_steps}, LayerSteps={self.layer_steps}")
+    
     def cleanup(self):
         """Clean up resources."""
         if self.client_socket:
@@ -1879,7 +1913,7 @@ class MATLABDRLTrainer:
                 print(f"  Mean episode reward: {np.mean(self.episode_rewards):.2f}")
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="DRL Training Server for MATLAB 5G Scheduler")
     
     # Server settings
@@ -1891,19 +1925,25 @@ def main():
     
     # Network architecture
     parser.add_argument('--hidden', type=int, default=32, help='Hidden layer size')
-    parser.add_argument('--n_quantiles', type=int, default=32, help='Number of quantiles for distributional critic')
+    parser.add_argument('--n_quantiles', type=int, default=16, help='Number of quantiles for distributional critic')
     
+    # System configurations
+    parser.add_argument("--n_cell_ue", type=int, default=512)
+    parser.add_argument("--max_sched_ue", type=int, default=64)
+    parser.add_argument("--n_layers", type=int, default=4)
+    parser.add_argument("--n_rbg", type=int, default=18)
+
     # DSACD hyperparameters
     parser.add_argument('--gamma', type=float, default=0.0, help='Discount factor')
     parser.add_argument('--tau', type=float, default=0.001, help='Target network soft update rate')
     parser.add_argument('--beta', type=float, default=0.98, help='Quantile Huber loss parameter')
-    parser.add_argument('--lr_actor', type=float, default=3e-4, help='Actor learning rate')
-    parser.add_argument('--lr_critic', type=float, default=3e-4, help='Critic learning rate')
-    parser.add_argument('--lr_alpha', type=float, default=3e-4, help='Temperature parameter learning rate')
+    parser.add_argument('--lr_actor', type=float, default=1e-4, help='Actor learning rate')
+    parser.add_argument('--lr_critic', type=float, default=1e-4, help='Critic learning rate')
+    parser.add_argument('--lr_alpha', type=float, default=1e-4, help='Temperature parameter learning rate')
     parser.add_argument('--fallback_action', type=int, default=-1, help='Fallback action index (last action)')
     
     # Training settings
-    parser.add_argument('--rb_capacity', type=int, default=50000, help='Replay buffer capacity')
+    parser.add_argument('--rb_capacity', type=int, default=72000, help='Replay buffer capacity')
     parser.add_argument('--batch_size', type=int, default=128, help='Training batch size')
     parser.add_argument('--learning_starts', type=int, default=500, help='Steps before training starts')
     parser.add_argument('--train_freq', type=int, default=8, help='Training frequency (every N steps)')
@@ -1914,7 +1954,10 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None, help='Load checkpoint to continue training')
     parser.add_argument('--out_dir', type=str, default='outputs/matlab_training', help='Output directory')
     
-    args = parser.parse_args()
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
     
     # Set random seeds
     torch.manual_seed(args.seed)
@@ -1943,28 +1986,9 @@ def main():
     print()
     
     # Create trainer with hyperparameters
-    trainer = MATLABDRLTrainer(port=args.port, device=args.device, verbose=args.verbose)
-    
-    # Store hyperparameters for network initialization
-    trainer.hyperparams = {
-        'hidden_dim': args.hidden,
-        'n_quantiles': args.n_quantiles,
-        'gamma': args.gamma,
-        'tau': args.tau,
-        'beta': args.beta,
-        'lr_actor': args.lr_actor,
-        'lr_critic': args.lr_critic,
-        'lr_alpha': args.lr_alpha,
-        'fallback_action': args.fallback_action,
-        'rb_capacity': args.rb_capacity,
-        'batch_size': args.batch_size,
-        'learning_starts': args.learning_starts,
-        'train_freq': args.train_freq,
-        'save_freq': args.save_freq,
-        'out_dir': args.out_dir,
-        'max_paired_ues': args.max_paired_ues,  # Max distinct UEs per RBG
-    }
-    
+    # trainer = MATLABDRLTrainer(port=args.port, device=args.device, verbose=args.verbose)
+    trainer = MATLABDRLTrainer(args)
+
     # Update replay buffer capacity
     trainer.replay_buffer = ReplayBuffer(capacity=args.rb_capacity)
     

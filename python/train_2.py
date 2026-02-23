@@ -510,10 +510,8 @@ def main(args):
                 f" layers/RBG={m_rand['avg_layers_per_rbg']:.2f}"
             )
             print(msg)
-    print("Training completed!")
-    print(f"Saving logs at {args.out_dir}")
+
     save_logs(args.out_dir, eval_log, train_log)
-    print(f"Plotting evaluation metrics ...")
     plot_eval("sample", eval_log["sample"], os.path.join(args.out_dir, "performance_with_sampling.png"))
     plot_eval("greedy", eval_log["greedy"], os.path.join(args.out_dir, "performance_with_greedy.png"))
     plot_eval("random", eval_log["random"], os.path.join(args.out_dir, "performance_with_random.png"))
