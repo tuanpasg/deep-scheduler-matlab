@@ -177,13 +177,6 @@ classdef nrDRLScheduler < nrScheduler
         % Using approximate formula: Ninfo * n_prb * overhead_factor / 8
         % We recompute inline for simplicity.
         TBSPrbSize = 18    % PRBs per RBG (typical)
-
-        %TrainingTputEMA Per-UE throughput EMA [Mbps], maintained internally.
-        % Updated each TTI in computeTrainingEvalMetrics using the same formula
-        % as nrScheduler.updateUEsServedDataRate (window = SchedulerConfig.PFSWindowSize).
-        % This mirrors UEsServedDataRate so logged metrics match the MATLAB visualizer
-        % regardless of whether SchedulerStrategy==1 (PFS) is active.
-        TrainingTputEMA = []   % initialised lazily (MaxUEs x 1)
     end
     % ===================================================================
     % DRL MOD END - Properties
@@ -1164,10 +1157,6 @@ classdef nrDRLScheduler < nrScheduler
             NOOP_LOCAL = obj.MaxUEs;   % same as Python's noop = max_sched_ue
             allocMatrix = NOOP_LOCAL * ones(numRBGs, obj.NumLayers);  % [numRBGs x NumLayers]
 
-            % ── Counters for invalid_action_rate metric ───────────────────────
-            invalid_action_count = 0;
-            total_action_count   = 0;
-
             % ── Send TTI_START ────────────────────────────────────────────────
             obj.TrainingTTICount = obj.TrainingTTICount + 1;
             obj.drlSendJSON(struct('type', 'TTI_START', ...
@@ -1197,15 +1186,10 @@ classdef nrDRLScheduler < nrScheduler
                 end
                 actions = double(resp.actions(:));  % column [numRBGs]
 
-                % Apply actions to allocMatrix (track validity against current mask)
+                % Apply actions to allocMatrix
                 for m = 1:numRBGs
                     a = actions(m);   % 0-based local index or NOOP_LOCAL
-                    total_action_count = total_action_count + 1;
                     if a >= 0 && a < numEligible
-                        if ~masks(m, a+1)
-                            % Agent chose an action blocked by the mask
-                            invalid_action_count = invalid_action_count + 1;
-                        end
                         allocMatrix(m, l+1) = a;
                     else
                         allocMatrix(m, l+1) = NOOP_LOCAL;
@@ -1234,8 +1218,7 @@ classdef nrDRLScheduler < nrScheduler
 
             % ── Compute eval metrics ──────────────────────────────────────────
             metrics = obj.computeTrainingEvalMetrics(allocMatrix, eligibleUEs, ...
-                WprgMap, sbCQIMap, numRBGs, rbgSize, ...
-                invalid_action_count, total_action_count);
+                                                     WprgMap, sbCQIMap, numRBGs, rbgSize);
 
             % Send TTI_DONE with metrics
             obj.drlSendJSON(struct('type', 'TTI_DONE', 'metrics', metrics));
@@ -1296,11 +1279,9 @@ classdef nrDRLScheduler < nrScheduler
                 WprgMap{rnti}     = Wprg;
                 buffers(rnti)     = ueCtx.BufferStatusDL;
 
-                % Feature 1: norm avg DL throughput (PFS-window exponential moving avg)
-                % UEsServedDataRate(1) is DL direction, units = bps (from nrScheduler)
-                % Normalize by MaxTput [Mbps] * 1e6 [bps/Mbps]
-                if ~isempty(ueCtx.UEsServedDataRate) && numel(ueCtx.UEsServedDataRate) >= 1
-                    fR = min(ueCtx.UEsServedDataRate(1) / (obj.MaxTput * 1e6), 1.0);
+                % Feature 1: norm avg throughput
+                if isprop(ueCtx, 'AverageThroughputDL')
+                    fR = min(ueCtx.AverageThroughputDL / obj.MaxTput, 1.0);
                 else
                     fR = 0;
                 end
@@ -1341,7 +1322,8 @@ classdef nrDRLScheduler < nrScheduler
 
             dlRank = 1;  wbCQI = 0;
             sbCQI_feat = zeros(1, numSubbandsFeat);
-            Wprg   = [];   % empty until a real CSI-RS precoder is received
+            Pports = obj.CellConfig(1).NumTransmitAntennas;
+            Wprg   = complex(ones(1, Pports, 1) / sqrt(Pports));
 
             csi = struct();
             if isfield(carrierCtx, 'CSIMeasurementDL') && ...
@@ -1654,13 +1636,9 @@ classdef nrDRLScheduler < nrScheduler
 
         % ──────────────────────────────────────────────────────────────────────
         function tbs_mbps = computeTBSMbps(obj, rnti, m) %#ok<INUSD>
-            %computeTBSMbps 3GPP-accurate TBS throughput [Mbps] for UE rnti on one RBG.
-            %   Uses nrTBS (3GPP TS 38.214 Sec 5.1.3.2) with:
-            %     - Wideband CQI -> MCS (MCS Table 1, 3GPP TS 38.214 Table 5.1.3.1-1)
-            %     - RI from CSI report for number of spatial layers (nLayers)
-            %     - Correct slot duration from CellConfig.SlotDuration (ms)
-            %     - NREPerPRB = 156: 168 total - 12 DMRS RE
-            %       (DMRS Type A, pos 2, single symbol, 2 CDM groups)
+            %computeTBSMbps Approximate TBS throughput [Mbps] for UE rnti on RBG m.
+            %   Uses wideband MCS from sbCQIMap stored in obj (set during buildFeatureMatrix).
+            %   Approximation: Ninfo * n_prb * overhead_factor / 8 / TTI_s / 1e6
 
             MCS_TABLE = [...
                 2, 120; 2, 157; 2, 193; 2, 251; 2, 308; 2, 379;
@@ -1670,51 +1648,44 @@ classdef nrDRLScheduler < nrScheduler
                 8, 772; 8, 822; 8, 873; 8, 910; 8, 948];
 
             CQI_TO_MCS = [0,0,1,3,5,7,9,11,13,15,18,20,22,24,26,28];
+            % MCS 0-based index
 
-            % Get WB CQI and RI (rank) from UE context
-            wbCQI   = 7;  % fallback CQI
-            nLayers = 1;  % fallback rank
+            % Get WB CQI for this UE directly from UEContext
+            wbCQI = 7;  % fallback
             if rnti >= 1 && rnti <= numel(obj.UEContext) && ~isempty(obj.UEContext(rnti))
                 carrierCtx_ = obj.UEContext(rnti).ComponentCarrier(1);
                 if isfield(carrierCtx_, 'CSIMeasurementDL') && ...
-                   isfield(carrierCtx_.CSIMeasurementDL, 'CSIRS')
-                    csi = carrierCtx_.CSIMeasurementDL.CSIRS;
-                    if isfield(csi, 'CQI') && ~isempty(csi.CQI)
-                        wbCQI = min(max(round(mean(csi.CQI(:))), 0), 15);
-                    end
-                    if isfield(csi, 'RI') && ~isempty(csi.RI)
-                        nLayers = max(1, min(double(csi.RI), 8));
-                    end
+                   isfield(carrierCtx_.CSIMeasurementDL, 'CSIRS') && ...
+                   isfield(carrierCtx_.CSIMeasurementDL.CSIRS, 'CQI') && ...
+                   ~isempty(carrierCtx_.CSIMeasurementDL.CSIRS.CQI)
+                    raw = carrierCtx_.CSIMeasurementDL.CSIRS.CQI;
+                    wbCQI = min(max(round(mean(raw(:))), 0), 15);
                 end
             end
 
-            mcs_idx = min(max(CQI_TO_MCS(wbCQI + 1), 0), 28);
-            Qm = MCS_TABLE(mcs_idx+1, 1);
-            R  = MCS_TABLE(mcs_idx+1, 2) / 1024.0;
+            mcs_idx = CQI_TO_MCS(wbCQI + 1);  % 0-based MCS
+            mcs_idx = min(max(mcs_idx, 0), 28);
+            Qm  = MCS_TABLE(mcs_idx+1, 1);
+            R   = MCS_TABLE(mcs_idx+1, 2) / 1024.0;
 
-            % Map bits-per-symbol to modulation string required by nrTBS
-            switch Qm
-                case 2,    modStr = 'QPSK';
-                case 4,    modStr = '16QAM';
-                case 6,    modStr = '64QAM';
-                case 8,    modStr = '256QAM';
-                otherwise, modStr = 'QPSK';
-            end
-
-            % NREPerPRB = 156 (12*14 - 12 DMRS RE per PRB, see above)
-            NREPerPRB = 156;
-            n_prb     = obj.TBSPrbSize;
-
-            % 3GPP TS 38.214 Sec 5.1.3.2 TBS via MATLAB nrTBS
-            tbs_bits = nrTBS(modStr, nLayers, n_prb, NREPerPRB, R);
-            if tbs_bits <= 0
+            n_prb        = obj.TBSPrbSize;   % PRBs per RBG
+            n_symb       = 14;
+            overhead_re  = 18;
+            N_re_prb     = max(0, 12 * n_symb - overhead_re);
+            Ninfo        = R * Qm * N_re_prb * n_prb;
+            if Ninfo <= 0
                 tbs_mbps = 0; return;
             end
+            if Ninfo <= 3824
+                TBS_bits = 6 * ceil(Ninfo / 6.0);
+            else
+                TBS_bits = 6 * ceil((Ninfo - 24) / 6.0);
+            end
+            TBS_bits = max(TBS_bits, 24);
+            TBS_bytes = TBS_bits / 8;
 
-            % Slot duration in seconds from cell config (SlotDuration is in ms)
-            % e.g. 0.5 ms for SCS = 30 kHz, 1 ms for SCS = 15 kHz
-            slot_s   = obj.CellConfig(1).SlotDuration * 1e-3;
-            tbs_mbps = tbs_bits / 1e6 / slot_s;
+            tti_s = 1e-3;  % 1 ms TTI
+            tbs_mbps = (TBS_bytes * 8) / 1e6 / tti_s;
         end
 
         % ──────────────────────────────────────────────────────────────────────
@@ -1743,32 +1714,19 @@ classdef nrDRLScheduler < nrScheduler
 
         % ──────────────────────────────────────────────────────────────────────
         function metrics = computeTrainingEvalMetrics(obj, allocMatrix, eligibleUEs, ...
-                ~, ~, numRBGs, ~, invalid_count, total_count)
-            %computeTrainingEvalMetrics Full per-TTI eval metrics for TTI_DONE.
-            %
-            %   Throughput:
-            %     total_cell_tput   – sum of scheduled rate[u,m] over all (m,l) [Mbps]
-            %     total_ue_tput     – [MaxUEs x 1] per-UE tput this TTI [Mbps]
-            %   Fairness:
-            %     alloc_counts      – [MaxUEs x 1] num (m,l) branches each UE got
-            %     jain_throughput   – Jain fairness index on total_ue_tput (eligible UEs)
-            %   PF utility:
-            %     pf_utility        – sum_u log(tput_u + eps), eligible UEs only
-            %   Sanity:
-            %     invalid_action_rate – fraction of actions not in mask
-            %     no_schedule_rate    – fraction of NOOP actions
-            %     avg_layers_per_rbg  – avg #scheduled layers per RBG
+                WprgMap, ~, numRBGs, ~)
+            %computeTrainingEvalMetrics Compute toy5g-style eval metrics for TTI_DONE.
+            %   Returns struct with: avg_cell_tput, jain, pf_utility,
+            %                        avg_layers_per_rbg, no_schedule_rate
+            a obj.GNB.MACEntity
+            NOOP_LOCAL = obj.MaxUEs;
 
-            NOOP_LOCAL  = obj.MaxUEs;
-            eps_val     = 1e-9;
-
-            alloc_cnts  = zeros(obj.MaxUEs, 1);   % allocation branch counts per UE
+            tput_ue    = zeros(obj.MaxUEs, 1);
             total_decisions = 0;
-            noop_count      = 0;
-            layers_sum      = 0;
+            noop_count = 0;
+            layers_sum = 0;
 
             for m = 1:numRBGs
-                % ── Collect scheduled locals and count NOOPs ──────────────────
                 scheduled_locals = [];
                 for l = 0:obj.NumLayers-1
                     a = allocMatrix(m, l+1);
@@ -1777,89 +1735,61 @@ classdef nrDRLScheduler < nrScheduler
                         noop_count = noop_count + 1;
                     else
                         scheduled_locals(end+1) = a; %#ok<AGROW>
-                        % Count per-UE (m,l) allocation branches
-                        if a < numel(eligibleUEs)
-                            rnti_a = eligibleUEs(a+1);
-                            if rnti_a <= obj.MaxUEs
-                                alloc_cnts(rnti_a) = alloc_cnts(rnti_a) + 1;
-                            end
-                        end
                     end
                 end
                 layers_sum = layers_sum + numel(scheduled_locals);
 
                 unique_locals = unique(scheduled_locals);
-                if isempty(unique_locals), continue; end
 
-            end
+                % Compute max kappa
+                max_kappa = 0;
+                rntis_sched = [];
+                for u = unique_locals
+                    if u < numel(eligibleUEs)
+                        rntis_sched(end+1) = eligibleUEs(u+1); %#ok<AGROW>
+                    end
+                end
+                for i = 1:numel(rntis_sched)-1
+                    for j = i+1:numel(rntis_sched)
+                        if rntis_sched(i) <= obj.MaxUEs && rntis_sched(j) <= obj.MaxUEs && ...
+                           ~isempty(WprgMap{rntis_sched(i)}) && ~isempty(WprgMap{rntis_sched(j)})
+                            k_val = obj.computeKappaWideband( ...
+                                WprgMap{rntis_sched(i)}, WprgMap{rntis_sched(j)});
+                            max_kappa = max(max_kappa, k_val);
+                        end
+                    end
+                end
+                penalty = 1.0 - max_kappa;
 
-            % ── Throughput EMA: mirrors nrScheduler.updateUEsServedDataRate ──────
-            % Maintains TrainingTputEMA[MaxUEs] in Mbps with the same PFS formula:
-            %   decay  : EMA *= (1 - 1/W)           for ALL UEs each TTI
-            %   update : EMA += (1/W) * instant_Mbps for scheduled UEs
-            % instantaneous = tbs_bits / slot_s / 1e6  [Mbps]   (same as nrScheduler)
-            % W = SchedulerConfig.PFSWindowSize (default 20)
-            W = 1;
-            try
-                W = double(obj.SchedulerConfig.PFSWindowSize(1));
-            catch
-            end
-            W = max(W, 1);   % ensure positive scalar
-
-            % Lazy initialise EMA vector
-            if isempty(obj.TrainingTputEMA) || numel(obj.TrainingTputEMA) ~= obj.MaxUEs
-                obj.TrainingTputEMA = zeros(obj.MaxUEs, 1);
-            end
-
-            % Step 1 – decay all UEs
-            obj.TrainingTputEMA = (1 - 1/W) * obj.TrainingTputEMA;
-
-            % Step 2 – update scheduled UEs with instantaneous TBS-based rate
-            for m = 1:numRBGs
-                unique_loc = unique(allocMatrix(m, :));
-                unique_loc = unique_loc(unique_loc ~= NOOP_LOCAL);
-                for u_local = unique_loc
+                for u_local = unique_locals
                     if u_local >= numel(eligibleUEs), continue; end
                     rnti_u = eligibleUEs(u_local + 1);
-                    if rnti_u > obj.MaxUEs, continue; end
-                    tbs_mbps = obj.computeTBSMbps(rnti_u, m);   % uses CQI+nLayers
-                    obj.TrainingTputEMA(rnti_u) = obj.TrainingTputEMA(rnti_u) + ...
-                        (1/W) * tbs_mbps;
+                    tbs_mbps = obj.computeTBSMbps(rnti_u, m);
+                    tput_ue(rnti_u) = tput_ue(rnti_u) + tbs_mbps * penalty;
                 end
             end
 
-            % Step 3 – read EMA for metric aggregation
-            tput_ue = obj.TrainingTputEMA;
+            % Aggregate
+            avg_cell_tput = sum(tput_ue);
+            eps_val = 1e-6;
 
-            % ── Aggregate metrics ─────────────────────────────────────────────
-            total_cell_tput = sum(tput_ue);
+            % Jain fairness
+            s1 = sum(tput_ue)^2;
+            s2 = numel(tput_ue) * sum(tput_ue.^2) + eps_val;
+            jain = s1 / s2;
 
-            % Restrict fairness / PF to eligible UEs (avoid log(0) from non-eligible)
-            tput_eligible = tput_ue(eligibleUEs);
-            nE = numel(tput_eligible);
+            % PF utility
+            pf_utility = sum(log(tput_ue + eps_val));
 
-            % Jain fairness index on eligible-UE throughputs
-            s1 = sum(tput_eligible)^2;
-            s2 = nE * sum(tput_eligible.^2) + eps_val;
-            jain_throughput = s1 / s2;
+            avg_layers_per_rbg = layers_sum / max(numRBGs, 1);
+            no_schedule_rate   = noop_count / max(total_decisions, 1);
 
-            % PF utility: sum_u log(tput_u + eps), eligible UEs only
-            pf_utility = sum(log(tput_eligible + eps_val));
-
-            % Sanity rates
-            avg_layers_per_rbg  = layers_sum / max(numRBGs, 1);
-            no_schedule_rate    = noop_count  / max(total_decisions, 1);
-            invalid_action_rate = invalid_count / max(total_count, 1);
-            fprintf("Cell TP = %f", total_cell_tput);
             metrics = struct( ...
-                'total_cell_tput',    total_cell_tput, ...
-                'total_ue_tput',      {num2cell(tput_ue.')}, ...
-                'alloc_counts',       {num2cell(alloc_cnts.')}, ...
-                'jain_throughput',    jain_throughput, ...
+                'avg_cell_tput',      avg_cell_tput, ...
+                'jain',               jain, ...
                 'pf_utility',         pf_utility, ...
-                'invalid_action_rate',invalid_action_rate, ...
-                'no_schedule_rate',   no_schedule_rate, ...
-                'avg_layers_per_rbg', avg_layers_per_rbg ...
+                'avg_layers_per_rbg', avg_layers_per_rbg, ...
+                'no_schedule_rate',   no_schedule_rate ...
             );
         end
 

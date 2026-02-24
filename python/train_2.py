@@ -309,17 +309,17 @@ class SimpleReplay:
             return x.to(device)
 
         out = {
-            "observation": stack("observation", torch.float32),
+            "observation":      stack("observation", torch.float32),
             "next_observation": stack("next_observation", torch.float32),
-            "rbg_index": stack("rbg_index", torch.long).squeeze(-1),
-            "action": stack("action", torch.long).squeeze(-1),
-            "reward": stack("reward", torch.float32).squeeze(-1),
-            "action_mask": stack("action_mask").to(torch.bool).squeeze(1)
-            if batch[0]["action_mask"].ndim == 1
-            else stack("action_mask").to(torch.bool),
+            "rbg_index":        stack("rbg_index", torch.long).squeeze(-1),
+            "action":           stack("action", torch.long).squeeze(-1),
+            "reward":           stack("reward", torch.float32).squeeze(-1),
+            "action_mask":      stack("action_mask").to(torch.bool).squeeze(1)
+                                if batch[0]["action_mask"].ndim == 1
+                                else stack("action_mask").to(torch.bool),
             "next_action_mask": stack("next_action_mask").to(torch.bool).squeeze(1)
-            if batch[0]["next_action_mask"].ndim == 1
-            else stack("next_action_mask").to(torch.bool),
+                                if batch[0]["next_action_mask"].ndim == 1
+                                else stack("next_action_mask").to(torch.bool),
         }
         return out
 

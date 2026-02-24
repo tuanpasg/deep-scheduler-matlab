@@ -34,7 +34,7 @@ muMIMOConfig.MaxNumUsersPaired = 4;       %
 muMIMOConfig.MinNumRBs = 3;               % Min 3 RBs
 muMIMOConfig.SemiOrthogonalityFactor = 0.6; 
 muMIMOConfig.MinCQI = 1;                  % Tương ứng CQI 1
-muMIMOConfig.MaxNumLayers = 8;           % 16 layers for gNB (for DRL scheduling)
+muMIMOConfig.MaxNumLayers = 16;          % 16 spatial streams per TTI (matches Python --n_layers 16)
 schedulerConfig = struct();
 schedulerConfig.ResourceAllocationType = 0;  % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 10;      % Max 4 UE scheduled per TTI
@@ -55,7 +55,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 250;          
+simConfig.NumFrameSimulation = 5;          
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -134,6 +134,7 @@ drlScheduler = nrDRLScheduler();
 
 % Cấu hình DRL scheduler
 drlScheduler.EnableDRL = true;
+drlScheduler.TrainingMode = true;  % Enable layer-by-layer training protocol (train_matlab.py)
 drlScheduler.NumLayers = muMIMOConfig.MaxNumLayers;  % 16 layers
 drlScheduler.MaxUsersPerRBG = muMIMOConfig.MaxNumUsersPaired;
 drlScheduler.MaxUEs = ueConfig.NumUEs;  % Số UE tối đa (cho feature matrix)
