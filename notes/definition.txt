@@ -1,0 +1,5 @@
+ dlPeakDataRate = 1e-6*numLayersDL*scaleFactorDL*8*(948/1024)*(gNB.NumResourceBlocks*12)/symbolDuration;
+ where:
+ mumLayersDL = min(gNB.NumTransmitAntennas, max([obj.UEs.NumReceiveAntennas]))
+ scaleFactorDL = 0.57
+ 

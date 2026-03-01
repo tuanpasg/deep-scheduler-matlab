@@ -2617,7 +2617,7 @@ classdef nrScheduler < handle & comm.internal.ConfigBase
             end
         end
 
-        function eligibleUEsList = getNewTxEligibleUEs(obj, gNBCarrierIndex, linkDir, reTxUEs)
+function eligibleUEsList = getNewTxEligibleUEs(obj, gNBCarrierIndex, linkDir, reTxUEs)
             %getNewTxEligibleUEs Return the UEs eligible for getting resources for new transmission
             % Eligible UEs must meet the criteria:
             % (i) UE did not get retransmission opportunity in the current TTI
@@ -2629,10 +2629,13 @@ classdef nrScheduler < handle & comm.internal.ConfigBase
             eligibleUEs = zeros(1,numNoReTxUEs);
             numEligibleUEs = 0;
             ueContext = obj.UEContext;
+            fprintf("noReTxUEs: %d",noReTxUEs)
             % Eliminate further the UEs which do not have free HARQ process
             for i = 1:numNoReTxUEs
+                fprintf("UE idx: %d\n",i)
                 ueInfo = ueContext(noReTxUEs(i));
                 freeHarqId = ueInfo.findFreeUEHarqProcess(linkDir, gNBCarrierIndex);
+                fprintf("freeHarqId: %d\n",freeHarqId)
                 if freeHarqId == -1
                     % No HARQ process free on this UE, so not eligible
                     continue;
@@ -2642,6 +2645,7 @@ classdef nrScheduler < handle & comm.internal.ConfigBase
                 else % UL
                     bufferAmount = ueInfo.BufferStatusUL;
                 end
+                 fprintf("linkDir: %d, bufferAmount: %d\n",linkDir, bufferAmount)
                 if bufferAmount == 0
                     % UE does not require any resources
                     continue;
@@ -2650,6 +2654,7 @@ classdef nrScheduler < handle & comm.internal.ConfigBase
                 eligibleUEs(numEligibleUEs) = noReTxUEs(i);
             end
             eligibleUEsList = eligibleUEs(1:numEligibleUEs);
+            disp(eligibleUEsList)
         end
 
         function [bitsPerRB, rbRequirement] = calculateRBRequirement(obj, rnti, linkDir, numSym, rank)

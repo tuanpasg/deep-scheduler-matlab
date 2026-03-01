@@ -448,6 +448,7 @@ classdef helperNRMetricsVisualizer < handle
             % The peak DL, UL throughput values for each UE
             dlPeakDataRate = 1e-6*numLayersDL*scaleFactorDL*8*(948/1024)*(gNB.NumResourceBlocks*12)/symbolDuration;
             ulPeakDataRate = 1e-6*numLayersUL*scaleFactorUL*8*(948/1024)*(gNB.NumResourceBlocks*12)/symbolDuration;
+            fprintf("numLayersDL: %d, numLayersUL: %d, scaleFactorDL: %0.2f, scaleFactorUL: %0.2f\n", numLayersDL, numLayersUL, scaleFactorDL, scaleFactorUL);
         end
 
         function metrics = getMetrics(obj)

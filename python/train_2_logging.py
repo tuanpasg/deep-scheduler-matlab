@@ -83,7 +83,7 @@ def plot_eval(mode: str, log: dict, out_path: str):
 
     # total_cell_tput + total_ue_tput (per-UE) in the same subplot
     ax = axs[0, 0]
-    # ax.plot(t, log["avg_cell_tput"], label="avg_cell_tput", linewidth=2)
+    ax.plot(t, log["avg_cell_tput"], label="avg_cell_tput", linewidth=2)
     ue_tput = log["avg_ue_tput"]
     if ue_tput:
         n_ue = len(ue_tput[0])
@@ -160,6 +160,10 @@ def save_logs(out_dir: str, eval_log: dict, train_log: dict):
         json.dump(train_log, f, indent=2)
 
 def plot_allocation(alloc_tensor, n_ue, out_path: str):
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     # Convert to numpy for plotting
     # alloc_tensor shape: [Layers, RBGs]
     data = alloc_tensor.cpu().numpy()
@@ -168,7 +172,7 @@ def plot_allocation(alloc_tensor, n_ue, out_path: str):
     
     # We use a discrete colormap. 'tab20' is good for up to 20 UEs.
     # We add +1 to account for a "NOOP" or "Empty" value if necessary.
-    cmap = plt.get_cmap('tab20', n_ue + 1) 
+    cmap = plt.get_cmap('Paired', n_ue + 1) 
     
     # Plotting the heatmap
     im = plt.imshow(data, aspect='auto', cmap=cmap, interpolation='nearest', vmin=0, vmax=n_ue)

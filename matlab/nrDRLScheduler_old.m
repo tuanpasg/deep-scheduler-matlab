@@ -16,7 +16,7 @@ classdef nrDRLScheduler < nrScheduler
         EnableDRL = true
 
         %NumLayers Number of MU-MIMO spatial layers (default: 16)
-        NumLayers = 4
+        NumLayers = 16
 
         %SchedulingStrategy Strategy identifier
         % "DRL" - use DRL action
@@ -27,10 +27,16 @@ classdef nrDRLScheduler < nrScheduler
         % This is typically limited by MU-MIMO capability
         MaxUsersPerRBG = 16
         
-        %EnablePairingConstraints Master flag to enable/disable MU-MIMO pairing constraints
-        % When true: both i1 matching AND precoder orthogonality checks are applied
-        % When false: no pairing constraints (any UE can be co-scheduled on same RBG)
-        EnablePairingConstraints = true
+        %EnableI1Constraint Enable PMI i1 matching constraint for MU-MIMO pairing
+        % When true: UEs co-scheduled on same RBG must have same i1 (wideband PMI)
+        % This ensures good beam orthogonality and reduces inter-user interference
+        % When false: no i1 constraint (original behavior)
+        EnableI1Constraint = true
+        
+        %EnableOrthogonalityConstraint Enable precoder orthogonality check for MU-MIMO
+        % When true: Check that paired UEs have orthogonal precoders (|W1'*W2| < threshold)
+        % This is essential for CSI-RS based MU-MIMO to reduce inter-user interference
+        EnableOrthogonalityConstraint = true
         
         %SemiOrthogonalityFactor Threshold for precoder orthogonality (0-1)
         % Two precoders are considered orthogonal if |W1'*W2|/max < (1 - SemiOrthogonalityFactor)
@@ -80,7 +86,7 @@ classdef nrDRLScheduler < nrScheduler
         UseSocket = false
 
         %MaxUEs Maximum number of UEs (for feature matrix sizing)
-        MaxUEs = 10
+        MaxUEs = 16
 
         %SubbandSize RBs per feature subband (for CQI features)
         SubbandSize = 16
@@ -115,20 +121,6 @@ classdef nrDRLScheduler < nrScheduler
         % This mirrors UEsServedDataRate so logged metrics match the MATLAB visualizer
         % regardless of whether SchedulerStrategy==1 (PFS) is active.
         TrainingTputEMA = []   % initialised lazily (MaxUEs x 1)
-
-        %UEList nrUE array — set externally (MU_MIMO.m) after connectUE().
-        % Required for ActualTputEMA: reads MAC.ReceivedBytes per UE per TTI.
-        UEList = []
-
-        %PrevRxBytes Cumulative DL ReceivedBytes per UE at end of last TTI [bytes].
-        % Used to compute per-TTI delta for ActualTputEMA.
-        PrevRxBytes = []   % [MaxUEs x 1], lazily initialised
-
-        %ActualTputEMA Per-UE actual DL received throughput EMA [Mbps].
-        % Ground-truth: updated from delta(UE MAC ReceivedBytes) each TTI.
-        % Replaces TrainingTputEMA as avg_tp in obs (fR feature) and
-        % reward denominator (Ru in PF formula).
-        ActualTputEMA = []   % [MaxUEs x 1], lazily initialised
 
         %PythonUEPriority Per-UE priority counter mirroring adapter's ue_priority.
         % Used to replicate adapter's selected_ues ordering so MATLAB can correctly
@@ -375,9 +367,7 @@ classdef nrDRLScheduler < nrScheduler
                 eligibleUEContext = ueContext(rnti);
                 carrierContext = eligibleUEContext.ComponentCarrier(1);
                 csiMeasurement = carrierContext.CSIMeasurementDL;
-                % Dùng mean(CQI) thay vì max(CQI) để tránh overestimate kênh
-                % max(CQI) lấy giá trị tốt nhất qua tất cả layers và subbands → MCS quá cao → BLER cao
-                csiMeasurementCQI = floor(mean(csiMeasurement.CSIRS.CQI(:))) * cqiSizeArray(1);
+                csiMeasurementCQI = max(csiMeasurement.CSIRS.CQI(:)) * cqiSizeArray(1);
                 channelQuality(rnti, :) = csiMeasurementCQI;
 
                 if isempty(carrierContext.CSIRSConfiguration)
@@ -463,24 +453,8 @@ classdef nrDRLScheduler < nrScheduler
                 % Fill DL assignment properties
                 dlAssignments(index).RNTI = selectedUE;
                 dlAssignments(index).FrequencyAllocation = freqAllocation(index, :);
-                dlAssignments(index).MCSIndex = min(max(mcsIndex(index) - mcsOffset, 0), 17);
-
-                % --- Kiểm tra precoding matrix W ---
-                W_ue = W{selectedUEIdx};
-                ueRank = schedulerInput.selectedRank(selectedUEIdx);
-                if obj.DRLDebug
-                    if isempty(W_ue)
-                        fprintf('[W-CHECK] UE %d: W EMPTY (rank=%d) — sẽ dùng fallback của MATLAB\n', selectedUE, ueRank);
-                    elseif isreal(W_ue)
-                        fprintf('[W-CHECK] UE %d: W là REAL (kỳ vọng complex) size=[%d x %d] rank=%d\n', ...
-                            selectedUE, size(W_ue,1), size(W_ue,2), ueRank);
-                    else
-                        colNorms = vecnorm(W_ue);
-                        fprintf('[W-CHECK] UE %d: W=[%d x %d] rank=%d complex=OK colNorms=[%s]\n', ...
-                            selectedUE, size(W_ue,1), size(W_ue,2), ueRank, num2str(colNorms, '%.3f '));
-                    end
-                end
-                dlAssignments(index).W = W_ue;
+                dlAssignments(index).MCSIndex = min(max(mcsIndex(index) - mcsOffset, 0), 27);
+                dlAssignments(index).W = W{selectedUEIdx};
 
                 % Mark frequency resources as assigned
                 updatedFrequencyStatus = updatedFrequencyStatus | freqAllocation(index,:);
@@ -646,7 +620,7 @@ classdef nrDRLScheduler < nrScheduler
                     % UEs co-scheduled on same RBG must have same i1 (wideband PMI)
                     % This ensures good beam orthogonality for MU-MIMO pairing
                     % ----------------------------------------------------------
-                    if obj.EnablePairingConstraints && ~isempty(allocatedUEIndicesThisRBG)
+                    if obj.EnableI1Constraint && ~isempty(allocatedUEIndicesThisRBG)
                         currentUEI1 = ueI1Values{actionIndex};
                         if ~isempty(currentUEI1)
                             % Check i1 matching with all already allocated UEs on this RBG
@@ -674,14 +648,14 @@ classdef nrDRLScheduler < nrScheduler
                     % Check that paired UEs have semi-orthogonal precoders
                     % |W_new' * W_existing| / max < (1 - SemiOrthogonalityFactor)
                     % ----------------------------------------------------------
-                    if obj.EnablePairingConstraints && ~isempty(allocatedUEIndicesThisRBG)
+                    if obj.EnableOrthogonalityConstraint && ~isempty(allocatedUEIndicesThisRBG)
                         W_new = W{actionIndex};
-                        if ~isempty(W_new)
+                        if ~isempty(W_new) && ~isreal(W_new)
                             isOrthogonal = true;
                             for allocIdx = 1:numel(allocatedUEIndicesThisRBG)
                                 existingUEIdx = allocatedUEIndicesThisRBG(allocIdx);
                                 W_existing = W{existingUEIdx};
-                                if ~isempty(W_existing)
+                                if ~isempty(W_existing) && ~isreal(W_existing)
                                     % Compute correlation between precoders
                                     % Handle both 2D (wideband) and 3D (subband) precoders
                                     % W can be [numPorts x numLayers] or [numLayers x numPorts x numSubbands]
@@ -786,7 +760,7 @@ classdef nrDRLScheduler < nrScheduler
                     end
                     
                     % Check and log i1 match status
-                    if obj.EnablePairingConstraints && numel(uniqueUEsOnRBG) > 1
+                    if obj.EnableI1Constraint && numel(uniqueUEsOnRBG) > 1
                         allI1Match = true;
                         for i = 1:numel(uniqueUEsOnRBG)-1
                             ue1Idx = find(eligibleUEs == uniqueUEsOnRBG(i), 1);
@@ -805,7 +779,7 @@ classdef nrDRLScheduler < nrScheduler
                     end
                     
                     % Check and log orthogonality status
-                    if obj.EnablePairingConstraints && numel(uniqueUEsOnRBG) > 1
+                    if obj.EnableOrthogonalityConstraint && numel(uniqueUEsOnRBG) > 1
                         maxCorrRBG = 0;
                         for i = 1:numel(uniqueUEsOnRBG)
                             for j = i+1:numel(uniqueUEsOnRBG)
@@ -815,7 +789,7 @@ classdef nrDRLScheduler < nrScheduler
                                    ue1Idx <= numel(W) && ue2Idx <= numel(W)
                                     W1 = W{ue1Idx};
                                     W2 = W{ue2Idx};
-                                    if ~isempty(W1) && ~isempty(W2)
+                                    if ~isempty(W1) && ~isempty(W2) && ~isreal(W1) && ~isreal(W2)
                                         try
                                             if ismatrix(W1) && ismatrix(W2)
                                                 w1 = W1(:) / (norm(W1(:)) + 1e-10);
@@ -1113,7 +1087,6 @@ classdef nrDRLScheduler < nrScheduler
             %     MATLAB → Python : TTI_START  {tti, n_layers, n_rbg,
             %                                   buf[MaxUEs], avg_tp[MaxUEs](Mbps),
             %                                   ue_rank[MaxUEs], wb_cqi[MaxUEs],
-            %                                   curr_mcs[MaxUEs],
             %                                   sub_cqi[MaxUEs x n_rbg],
             %                                   max_cross_corr[MaxUEs x MaxUEs x n_rbg]}
             %     Python → MATLAB : LAYER_ACT  {actions[n_layers x n_rbg]}
@@ -1135,30 +1108,6 @@ classdef nrDRLScheduler < nrScheduler
             % ── Build feature matrix (same as before) ─────────────────────────
             [~, WprgMap, sbCQIMap, rankMap, buffers, ~, wb_cqi_raw] = ...
                 obj.buildTrainingFeatureMatrix(eligibleUEs, numRBGs, rbgSize, numSubbandsFeat, numRBs);
-
-            % Instantaneous DL throughput from previous slot (Mbps)
-            if isempty(obj.PrevRxBytes) || numel(obj.PrevRxBytes) ~= obj.MaxUEs
-                obj.PrevRxBytes = zeros(obj.MaxUEs, 1);
-            end
-            inst_tp_all = zeros(1, obj.MaxUEs); % [Mbps], indexed by RNTI
-            slot_s = obj.CellConfig(1).SlotDuration * 1e-3; % Slot duration in seconds
-            if ~isempty(obj.UEList)
-                for ueIdx = 1:numel(obj.UEList)
-                    ue   = obj.UEList(ueIdx);
-                    rnti = ue.RNTI;
-                    if rnti < 1 || rnti > obj.MaxUEs
-                        continue;
-                    end
-                    try
-                        rxBytes = statistics(ue).MAC.ReceivedBytes;
-                    catch
-                        continue;
-                    end
-                    deltaBytes = max(rxBytes - obj.PrevRxBytes(rnti), 0);
-                    inst_tp_all(rnti) = deltaBytes * 8 / 1e6 / slot_s;
-                    obj.PrevRxBytes(rnti) = rxBytes;
-                end
-            end
 
             % ── Lazy-init PythonUEPriority (mirrors adapter's ue_priority) ───────
             if isempty(obj.PythonUEPriority) || numel(obj.PythonUEPriority) ~= obj.MaxUEs
@@ -1182,10 +1131,6 @@ classdef nrDRLScheduler < nrScheduler
             wb_cqi_all = zeros(1, obj.MaxUEs);
             sb_cqi_all = zeros(obj.MaxUEs, numRBGs);
 
-            if (numEligible<obj.MaxUEs)
-                % fprintf('>>> WARNING: numEligible: %d\n', numEligible);
-            end
-
             for k = 1:numEligible
                 rnti = eligibleUEs(k);
                 if rnti <= obj.MaxUEs
@@ -1193,38 +1138,12 @@ classdef nrDRLScheduler < nrScheduler
                     rank_all(rnti)     = rankMap(rnti);
                     wb_cqi_all(rnti)   = wb_cqi_raw(rnti);
                     sb_cqi_all(rnti,:) = sbCQIMap(rnti, :);
-                    % Dùng ActualTputEMA (ground-truth); fallback TrainingTputEMA
-                    avg_tp_all(rnti) = max(inst_tp_all(rnti), 1e-6);
+                    if ~isempty(obj.TrainingTputEMA) && numel(obj.TrainingTputEMA) >= rnti
+                        avg_tp_all(rnti) = max(obj.TrainingTputEMA(rnti), 1e-6);  % clamp to eps
+                    end
                 end
             end
 
-            % ── Per-UE MCS from scheduler logic (same selectMCSIndexDL path) ─
-            curr_mcs_all = zeros(1, obj.MaxUEs);
-            for k = 1:numEligible
-                rnti = eligibleUEs(k);
-                if rnti > obj.MaxUEs
-                    continue;
-                end
-
-                cqiForMCS = wb_cqi_all(rnti);
-                cqiRow = sbCQIMap(rnti, :);
-                validCQI = cqiRow(~isnan(cqiRow));
-                if ~isempty(validCQI)
-                    cqiForMCS = floor(mean(validCQI));
-                end
-
-                cqiForMCS = min(max(cqiForMCS, 0), 15);
-                mcsForReport = min(max(selectMCSIndexDL(obj, cqiForMCS, rnti), 0), 28);
-
-                % Apply MU MCS backoff before reporting curr_mcs to Python.
-                % At TTI_START, co-scheduling is not known yet, so use one-step
-                % conservative backoff when MU mode is configured.
-                if obj.NumLayers > 1 && obj.MU_MCSBackoff > 0
-                    mcsForReport = max(0, mcsForReport - obj.MU_MCSBackoff);
-                end
-                curr_mcs_all(rnti) = mcsForReport;
-            end
-            fprintf("MCS: %s\n", mat2str(curr_mcs_all));
             % ── Build pairwise cross-correlation [MaxUEs x MaxUEs x numRBGs] ──
             %    cross_corr_3d(ri, rj, m) = wideband kappa(RNTI ri, RNTI rj).
             %    Wideband precoder → replicated identically for every RBG m.
@@ -1240,10 +1159,6 @@ classdef nrDRLScheduler < nrScheduler
                        ~isempty(WprgMap{ri}) && ~isempty(WprgMap{rj})
                         kappa_val = obj.computeKappaWideband(WprgMap{ri}, WprgMap{rj});
                         cross_corr_3d(ri, rj, :) = kappa_val;
-                    else
-                        % No precoder available yet (CSI-RS not received) →
-                        % conservative: treat as fully correlated (not orthogonal)
-                        cross_corr_3d(ri, rj, :) = 1.0;
                     end
                 end
             end
@@ -1265,10 +1180,8 @@ classdef nrDRLScheduler < nrScheduler
                 'avg_tp',         {num2cell(double(avg_tp_all))}, ...
                 'ue_rank',        {num2cell(double(rank_all))}, ...
                 'wb_cqi',         {num2cell(double(wb_cqi_all))}, ...
-                'curr_mcs',       {num2cell(double(curr_mcs_all))}, ...
                 'sub_cqi',        {sb_cqi_cell}, ...
-                'max_cross_corr', {cross_corr_cell}, ...
-                'eligible_ues',   {num2cell(double(eligibleUEs))}...
+                'max_cross_corr', {cross_corr_cell} ...
             );
             obj.drlSendJSON(payload);
 
@@ -1281,7 +1194,7 @@ classdef nrDRLScheduler < nrScheduler
             end
 
             actions_raw = resp.actions;   % [n_layers x n_rbg] MATLAB matrix
-            % disp(actions_raw)
+
             % ── Map Python local-index → RNTI using selectedOrder ─────────────
             %    val = adapter's _alloc[l,m] = local index within selected_ues (0-based).
             %    selectedOrder(val+1) = RNTI corresponding to that local index.
@@ -1292,8 +1205,7 @@ classdef nrDRLScheduler < nrScheduler
                 for m = 1:numRBGs
                     val = double(actions_raw(l, m));
                     if val >= 0 && val < obj.MaxUEs
-                        % rnti_mapped = selectedOrder(val + 1);
-                        rnti_mapped = val + 1;
+                        rnti_mapped = selectedOrder(val + 1);
                         ue_pos = find(eligibleUEs == rnti_mapped, 1);
                         if ~isempty(ue_pos)
                             allocMatrix(m, l) = ue_pos - 1;   % 0-based eligible index
@@ -1301,7 +1213,7 @@ classdef nrDRLScheduler < nrScheduler
                     end
                 end
             end
-            % disp(allocMatrix)
+
             % ── Update PythonUEPriority (mirrors adapter's finish_tti) ────────
             %    adapter: ue_priority += 1 for all, then reset to 0 for allocated UEs.
             %    "allocated" = local index u appears anywhere in _alloc matrix.
@@ -1378,11 +1290,10 @@ classdef nrDRLScheduler < nrScheduler
                 WprgMap{rnti}     = Wprg;
                 buffers(rnti)     = ueCtx.BufferStatusDL;
 
-                % Feature 1: norm avg DL throughput — ActualTputEMA (ground-truth
-                % ReceivedBytes EMA); fallback to TrainingTputEMA if not yet available.
-                if ~isempty(obj.ActualTputEMA) && numel(obj.ActualTputEMA) >= rnti
-                    fR = min(obj.ActualTputEMA(rnti) / obj.MaxTput, 1.0);
-                elseif ~isempty(obj.TrainingTputEMA) && numel(obj.TrainingTputEMA) >= rnti
+                % Feature 1: norm avg DL throughput — đọc từ TrainingTputEMA [Mbps]
+                % (TrainingTputEMA được update cuối TTI trong computeTrainingEvalMetrics
+                %  với cùng PFS-window formula; phản ánh past-averaged throughput TTI trước)
+                if ~isempty(obj.TrainingTputEMA) && numel(obj.TrainingTputEMA) >= rnti
                     fR = min(obj.TrainingTputEMA(rnti) / obj.MaxTput, 1.0);
                 else
                     fR = 0;
@@ -1415,12 +1326,9 @@ classdef nrDRLScheduler < nrScheduler
 
                 exportMatrix(rnti, :) = [fR, fH, fD, fB, fO, fG, fRho_feat];
 
-                % avg_tp_bps cho TTI_RAW_DATA: dùng ActualTputEMA (ground-truth),
-                % fallback TrainingTputEMA nếu chưa có data.
-                if ~isempty(obj.ActualTputEMA) && numel(obj.ActualTputEMA) >= rnti
-                    avg_tp_bps(rnti) = obj.ActualTputEMA(rnti) * 1e6;   % Mbps → bps
-                elseif ~isempty(obj.TrainingTputEMA) && numel(obj.TrainingTputEMA) >= rnti
-                    avg_tp_bps(rnti) = obj.TrainingTputEMA(rnti) * 1e6;
+                % Store raw values for TTI_RAW_DATA protocol — dùng TrainingTputEMA [bps]
+                if ~isempty(obj.TrainingTputEMA) && numel(obj.TrainingTputEMA) >= rnti
+                    avg_tp_bps(rnti) = obj.TrainingTputEMA(rnti) * 1e6;   % Mbps → bps
                 end
                 wb_cqi_raw(rnti) = wbCQI;
             end
@@ -1943,40 +1851,8 @@ classdef nrDRLScheduler < nrScheduler
                 end
             end
 
-            % ── ActualTputEMA: ground-truth DL received bytes per UE ─────────────
-            % Dùng cumulative ReceivedBytes / elapsed_time thay vì delta per-TTI.
-            % Lý do: ReceivedBytes chỉ tăng khi HARQ ACK về (không phải mỗi TTI)
-            % nên delta per-TTI = 0 hầu hết thời gian → EMA-decay làm mất signal.
-            % cumBytes/elapsed là running average ổn định, không bị bursty.
-            if ~isempty(obj.UEList)
-                slot_s = obj.CellConfig(1).SlotDuration * 1e-3 * 2;
-                % obj.TrainingTTICount = obj.TrainingTTICount + 1;
-                elapsed_s = max(obj.TrainingTTICount * slot_s, slot_s);  % tránh /0
-
-                if isempty(obj.ActualTputEMA) || numel(obj.ActualTputEMA) ~= obj.MaxUEs
-                    obj.ActualTputEMA = zeros(obj.MaxUEs, 1);
-                end
-
-                for ueIdx = 1:numel(obj.UEList)
-                    ue   = obj.UEList(ueIdx);
-                    rnti = ue.RNTI;
-                    if rnti < 1 || rnti > obj.MaxUEs, continue; end
-                    try
-                        rxBytes = statistics(ue).MAC.ReceivedBytes;
-                    catch
-                        continue;
-                    end
-                    % Cumulative average: tổng bytes nhận được / thời gian đã chạy [Mbps]
-                    obj.ActualTputEMA(rnti) = rxBytes * 8 / 1e6 / elapsed_s;
-                end
-            end
-
-            % Step 3 – use ActualTputEMA (ground-truth) if available, else TBS EMA
-            if ~isempty(obj.ActualTputEMA) && numel(obj.ActualTputEMA) == obj.MaxUEs
-                tput_ue = obj.ActualTputEMA;
-            else
-                tput_ue = obj.TrainingTputEMA;
-            end
+            % Step 3 – read EMA for metric aggregation
+            tput_ue = obj.TrainingTputEMA;
 
             % ── Aggregate metrics ─────────────────────────────────────────────
             total_cell_tput = sum(tput_ue);
@@ -1997,23 +1873,7 @@ classdef nrDRLScheduler < nrScheduler
             avg_layers_per_rbg  = layers_sum / max(numRBGs, 1);
             no_schedule_rate    = noop_count  / max(total_decisions, 1);
             invalid_action_rate = invalid_count / max(total_count, 1);
-            % Log tất cả MaxUEs; UE không eligible TTI này đánh dấu *
-            if islogical(eligibleUEs)
-                elig_set = find(eligibleUEs);
-            else
-                elig_set = eligibleUEs(:).';
-            end
-            parts = cell(1, obj.MaxUEs);
-            for r = 1:obj.MaxUEs
-                if ismember(r, elig_set)
-                    parts{r} = sprintf("%d:%.2f", r, tput_ue(r));
-                else
-                    parts{r} = sprintf("%d*:%.2f", r, tput_ue(r));
-                end
-            end
-            % fprintf("[DRLScheduler] ActualCellTput=%.2f Mbps (TBS-EMA=%.2f) | %s\n", ...
-            %     total_cell_tput, sum(obj.TrainingTputEMA), ...
-            %     strjoin(string(parts), "  "));
+            fprintf("Cell TP = %f", total_cell_tput);
             metrics = struct( ...
                 'total_cell_tput',    total_cell_tput, ...
                 'total_ue_tput',      {num2cell(tput_ue.')}, ...

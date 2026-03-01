@@ -3,7 +3,7 @@
 % --- gNB CONFIGURATION (32T32R) ---
 gNBConfig = struct();
 gNBConfig.Position = [0 0 30];            % Vị trí [x,y,z]
-gNBConfig.TransmitPower = 25;             % Công suất phát (dBm) ~ theo yêu cầu trung bình
+gNBConfig.TransmitPower = 60;             % Công suất phát (dBm) ~ theo yêu cầu trung bình
 gNBConfig.SubcarrierSpacing = 30000;      % 30 kHz
 gNBConfig.CarrierFrequency = 4.9e9;       % 4.9 GHz
 gNBConfig.ChannelBandwidth = 100e6;       % 100 MHz
@@ -21,8 +21,8 @@ ueConfig.NumUEs = 4;                    % 16 UEs connected
 ueConfig.NumTransmitAntennas = 1;
 ueConfig.NumReceiveAntennas = 1;          % 4 Anten thu mỗi UE
 ueConfig.ReceiveGain = 0;                 % Gain 0 dBi
-ueConfig.MaxDistance = 2000;              % Bán kính 1200m
-ueConfig.MinDistance = 100;                
+ueConfig.MaxDistance = 1200;              % Bán kính 1200m
+ueConfig.MinDistance = 10;                
 ueConfig.AzimuthRange = [-30 30];         % Góc phương vị +/- 30 độ
 ueConfig.ElevationAngle = 0;    
 ueConfig.NoiseFigureMin = 7;              % More realistic NF: 7-9 dB
@@ -40,7 +40,6 @@ schedulerConfig.ResourceAllocationType = 0;  % RB-based
 schedulerConfig.MaxNumUsersPerTTI = 10;      % Max 4 UE scheduled per TTI
 schedulerConfig.SignalType = "CSI-RS";      % Use CSI-RS for channel measurement
 schedulerConfig.PFSWindowSize = 20;                  % EMA window 20 slots (avg_tp_bps cho Python obs)
-schedulerConfig.RVSequence = 0;                      % Disable HARQ retransmissions (RV0 only → no reTx)
 
 % --- CSI report granularity (Subband/PRG PMI) ---
 % Choose subband/PRG size in RBs. Typical values: 2 or 4.
@@ -57,7 +56,7 @@ channelConfig.Orientation = [60; 0; 0];     % Hướng anten gNB
 
 % --- SIMULATION CONTROL ---
 simConfig = struct();
-simConfig.NumFrameSimulation = 3;          
+simConfig.NumFrameSimulation = 2;          
 simConfig.EnableTraces = true;              
 
 %% ====================== 2. INITIALIZATION ======================
@@ -141,13 +140,13 @@ drlScheduler.NumLayers = muMIMOConfig.MaxNumLayers;  % 16 layers
 drlScheduler.MaxUsersPerRBG = muMIMOConfig.MaxNumUsersPaired;
 drlScheduler.MaxUEs = ueConfig.NumUEs;  % Số UE tối đa (cho feature matrix)
 drlScheduler.SubbandSize = csiReportConfig.SubbandSize;  % Subband size cho CQI features
-drlScheduler.DRLDebug = false;  % Bật debug output
+drlScheduler.DRLDebug = true;  % Bật debug output
 
 % CSI-RS based MU-MIMO constraints
-% Set to false to disable both i1 matching AND precoder orthogonality checks
-drlScheduler.EnablePairingConstraints = false;
-drlScheduler.SemiOrthogonalityFactor = muMIMOConfig.SemiOrthogonalityFactor;  % 0.6
-drlScheduler.MU_MCSBackoff = 5;                      % Reduce MCS by 2 per co-scheduled UE
+drlScheduler.EnableI1Constraint = true;              % UEs must have same i1 (wideband beam)
+drlScheduler.EnableOrthogonalityConstraint = true;   % Check precoder orthogonality
+drlScheduler.SemiOrthogonalityFactor = muMIMOConfig.SemiOrthogonalityFactor;  % 0.7
+drlScheduler.MU_MCSBackoff = 2;                      % Reduce MCS by 2 per co-scheduled UE
 
 % Kết nối tới Python DRL server qua socket
 ok = drlScheduler.connectToDRLAgent('127.0.0.1', 5556);
@@ -161,24 +160,15 @@ linkAdaptationConfig = struct(...
     'StepUp', 0.5, ...        % Reduced from 1.0 (increase MCS slower on ACK)
     'StepDown', 0.1);         % Increased from 0.02 (decrease MCS faster on NACK)       
 
-% configureScheduler(gNB, ...
-%     'Scheduler', drlScheduler, ...
-%     'ResourceAllocationType', schedulerConfig.ResourceAllocationType, ...
-%     'MaxNumUsersPerTTI', schedulerConfig.MaxNumUsersPerTTI, ...
-%     'PFSWindowSize', schedulerConfig.PFSWindowSize, ...
-%     'MUMIMOConfigDL', muMIMOStruct, ...
-%     'LinkAdaptationConfigDL', linkAdaptationConfig, ...
-%     'CSIMeasurementSignalDL', schedulerConfig.SignalType);
-
-    configureScheduler(gNB, ...
+configureScheduler(gNB, ...
     'Scheduler', drlScheduler, ...
     'ResourceAllocationType', schedulerConfig.ResourceAllocationType, ...
     'MaxNumUsersPerTTI', schedulerConfig.MaxNumUsersPerTTI, ...
     'PFSWindowSize', schedulerConfig.PFSWindowSize, ...
     'MUMIMOConfigDL', muMIMOStruct, ...
     'LinkAdaptationConfigDL', linkAdaptationConfig, ...
-    'CSIMeasurementSignalDL', schedulerConfig.SignalType, ...
-    'RVSequence', schedulerConfig.RVSequence);
+    'CSIMeasurementSignalDL', schedulerConfig.SignalType);
+
 % NOTE: SchedulerStrategy=1 bị xoá — nó trigger updateUEsServedDataRate của
 % MATLAB internal (nrUEContext) trong MU-MIMO mode → crash "Matrix dimensions
 % must agree". EMA tracking được xử lý hoàn toàn bên trong TrainingTputEMA
@@ -210,9 +200,6 @@ end
 connectUE(gNB, UEs, FullBufferTraffic="on", ...
     CSIReportPeriodicity=10, CSIRSConfig=gNB.CSIRSConfiguration, ...  % Reduced to match CSI-RS period
     CustomContext=csiReportConfig);
-
-% Cấp UE objects cho DRL scheduler để đọc MAC.ReceivedBytes thực tế
-drlScheduler.UEList = UEs;
 
 % % === MIXED TRAFFIC SCENARIO ===
 % % UE 1-6: Video streaming (high data rate, bursty)
@@ -280,6 +267,7 @@ simulationLogFile = "simulationLogs_128T128R";
 simulationTime = simConfig.NumFrameSimulation * 1e-2;
 
 fprintf('Dang chay mo phong 128T128R trong %.2f giay...\n', simulationTime);
+
 run(networkSimulator, simulationTime);
 
 % Notify Python that simulation is complete
